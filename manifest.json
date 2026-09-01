@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "Connection Manager",
+  "version": "1.0.0",
+  "description": "Manage connection invitations.",
+  "permissions": [
+    "storage",
+    "activeTab",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://*.linkedin.com/*"
+  ],
+  "background": {
+    "service_worker": "src/background/service-worker.js"
+  },
+  "action": {
+    "default_popup": "index.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.linkedin.com/*"
+      ],
+      "js": [
+        "src/content/network.js",
+        "src/content/invitations.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}
