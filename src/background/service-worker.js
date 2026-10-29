@@ -85,6 +85,67 @@ function recordAction(message, field, sendResponse) {
   );
 }
 
+function stopAutomation(message, sendResponse) {
+  const stopConfig = {
+    connect: {
+      enabledField: 'connectEnabled',
+      statusField: 'connectStatus',
+      reasonField: 'connectStopReason',
+      status: 'error',
+      reason: 'weekly_invitation_limit',
+    },
+    withdraw: {
+      enabledField: 'withdrawEnabled',
+      statusField: 'withdrawStatus',
+      reasonField: 'withdrawStopReason',
+      status: 'completed',
+      reason: 'all_invitations_withdrawn',
+    },
+  }[message.payload?.automation];
+
+  if (!stopConfig || message.payload?.reason !== stopConfig.reason) {
+    sendResponse({ success: false, error: 'Invalid automation stop request' });
+    return;
+  }
+
+  const update = countUpdateQueue.then(async () => {
+    const { settings = {}, state = {} } = await chrome.storage.local.get([
+      'settings',
+      'state',
+    ]);
+    const nextSettings = {
+      connectEnabled: false,
+      withdrawEnabled: false,
+      maxActionsPerRun: 20,
+      paused: false,
+      ...settings,
+      [stopConfig.enabledField]: false,
+    };
+    const nextState = {
+      connectStatus: 'idle',
+      withdrawStatus: 'idle',
+      connectCount: 0,
+      withdrawCount: 0,
+      ...state,
+      [stopConfig.statusField]: stopConfig.status,
+      [stopConfig.reasonField]: stopConfig.reason,
+    };
+
+    await chrome.storage.local.set({ settings: nextSettings, state: nextState });
+    return true;
+  });
+
+  countUpdateQueue = update.catch(() => {});
+  update.then(
+    () => sendResponse({ success: true }),
+    (error) =>
+      sendResponse({
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+      }),
+  );
+}
+
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.type === 'GET_ACTIVE_TAB') {
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
@@ -129,6 +190,11 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   if (message.type === 'INVITATION_DETECTED') {
     recordAction(message, 'withdrawCount', sendResponse);
+    return true;
+  }
+
+  if (message.type === 'STOP_AUTOMATION') {
+    stopAutomation(message, sendResponse);
     return true;
   }
 

@@ -68,8 +68,70 @@ function incrementCounter(
   return update;
 }
 
+function stopAutomation(
+  automation: 'connect' | 'withdraw',
+  reason: 'weekly_invitation_limit' | 'all_invitations_withdrawn'
+): Promise<void> {
+  const stopConfig = {
+    connect: {
+      enabledField: 'connectEnabled',
+      statusField: 'connectStatus',
+      reason: 'weekly_invitation_limit',
+      status: 'error'
+    },
+    withdraw: {
+      enabledField: 'withdrawEnabled',
+      statusField: 'withdrawStatus',
+      reason: 'all_invitations_withdrawn',
+      status: 'completed'
+    }
+  }[automation];
+
+  if (reason !== stopConfig.reason) {
+    return Promise.reject(new Error('Invalid automation stop request'));
+  }
+
+  const update = countUpdateQueue.then(async () => {
+    await updateSettings({ [stopConfig.enabledField]: false });
+    const state = await getState();
+    await updateState({
+      ...state,
+      [stopConfig.statusField]: stopConfig.status,
+      [`${automation}StopReason`]: reason
+    });
+  });
+
+  countUpdateQueue = update.catch(() => undefined);
+  return update;
+}
+
 chrome.runtime.onMessage.addListener(
   (message, _sender, sendResponse) => {
+    if (message.type === 'STOP_AUTOMATION') {
+      const { automation, reason } = message.payload ?? {};
+      if (
+        (automation !== 'connect' && automation !== 'withdraw') ||
+        (reason !== 'weekly_invitation_limit' &&
+          reason !== 'all_invitations_withdrawn')
+      ) {
+        sendResponse({
+          success: false,
+          error: 'Invalid automation stop request'
+        });
+        return true;
+      }
+
+      void stopAutomation(automation, reason)
+        .then(() => sendResponse({ success: true }))
+        .catch(error =>
+          sendResponse({
+            success: false,
+            error: error instanceof Error ? error.message : String(error)
+          })
+        );
+      return true;
+    }
+
     if (message.type === 'GET_ACTIVE_TAB') {
       chrome.tabs.query(
         {

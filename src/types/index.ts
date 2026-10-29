@@ -2,7 +2,8 @@ export type AutomationStatus =
   | 'idle'
   | 'running'
   | 'paused'
-  | 'completed';
+  | 'completed'
+  | 'error';
 
 export interface ConnectionCandidate {
   id: string;
@@ -31,4 +32,6 @@ export interface AutomationState {
   withdrawStatus: AutomationStatus;
   connectCount: number;
   withdrawCount: number;
+  connectStopReason?: 'weekly_invitation_limit';
+  withdrawStopReason?: 'all_invitations_withdrawn';
 }

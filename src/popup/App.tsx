@@ -21,6 +21,13 @@ const defaultState: AutomationState = {
   withdrawCount: 0
 };
 
+const stopReasonMessages = {
+  weekly_invitation_limit:
+    'LinkedIn đã áp dụng giới hạn lời mời trong tuần. Tính năng gửi lời mời đã tự dừng; hãy thử lại khi giới hạn được đặt lại.',
+  all_invitations_withdrawn:
+    'Đã thu hồi hết lời mời đang chờ. Tính năng thu hồi đã tự dừng.'
+};
+
 export default function App() {
   const [settings, setSettings] = useState(defaultSettings);
   const [state, setState] = useState(defaultState);
@@ -140,6 +147,16 @@ export default function App() {
         ? withdrawEnabled
         : false;
   const modeEnabled = featureEnabled && !settings.paused;
+  const stopReason =
+    featureEnabled
+      ? undefined
+      : pageMode === 'connect'
+        ? state.connectStopReason
+        : pageMode === 'withdraw'
+          ? state.withdrawStopReason
+          : undefined;
+  const completed = state.withdrawStatus === 'completed' && Boolean(stopReason);
+  const stoppedWithError = state.connectStatus === 'error' && Boolean(stopReason);
 
   return (
     <main className="popup">
@@ -156,21 +173,29 @@ export default function App() {
         data-state={
           loading
             ? 'loading'
-            : settings.paused && featureEnabled
-              ? 'paused'
-              : modeEnabled
-                ? 'running'
-                : 'idle'
+            : stoppedWithError
+              ? 'error'
+              : completed
+                ? 'completed'
+                : settings.paused && featureEnabled
+                  ? 'paused'
+                  : modeEnabled
+                    ? 'running'
+                    : 'idle'
         }
         aria-live="polite"
       >
         {loading
           ? 'Đang kiểm tra trang...'
-          : settings.paused && featureEnabled
-            ? 'Đang tạm dừng'
-          : modeEnabled
-            ? 'Đã bật trên trang này'
-            : 'Đang tắt'}
+          : stoppedWithError
+            ? 'Đã dừng do giới hạn tuần'
+            : completed
+              ? 'Đã thu hồi hết lời mời'
+              : settings.paused && featureEnabled
+                ? 'Đang tạm dừng'
+                : modeEnabled
+                  ? 'Đã bật trên trang này'
+                  : 'Đang tắt'}
       </div>
 
       {pageMode === 'connect' && (
@@ -227,6 +252,11 @@ export default function App() {
       )}
 
       {error && <p role="alert">{error}</p>}
+      {stopReason && (
+        <p className="helper-text" role="status">
+          {stopReasonMessages[stopReason]}
+        </p>
+      )}
 
       {pageMode === 'connect' && (
         <section className="settings-card">

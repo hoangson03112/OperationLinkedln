@@ -8,6 +8,7 @@ const withdrawState = {
   processed: new Set(),
   retryAfter: new Map(),
   lastNoButtonsLogAt: 0,
+  stopRequested: false,
 };
 
 function normalizeText(value) {
@@ -69,6 +70,53 @@ function isInvitationPage() {
 
 function isSentInvitationPage() {
   return /^\/mynetwork\/invitation-manager\/sent\/?$/.test(location.pathname);
+}
+
+function isSentInvitationListEmpty() {
+  const text = normalizeText(document.body?.innerText || "");
+  return (
+    /\bno\s+(?:pending\s+|sent\s+|outstanding\s+)?invitations?\b/.test(text) ||
+    /\b(?:you\s+)?(?:do not have|don't have|have not|haven't)\s+(?:any\s+)?(?:pending\s+|sent\s+|outstanding\s+)?invitations?\b/.test(
+      text,
+    ) ||
+    /\bthere (?:are|aren't) no\s+(?:pending\s+|sent\s+|outstanding\s+)?invitations?\b/.test(
+      text,
+    ) ||
+    /\bno invitations? to (?:show|display|withdraw)\b/.test(text) ||
+    /\bkhong co loi moi\b/.test(text)
+  );
+}
+
+async function stopWhenInvitationsAreExhausted() {
+  if (withdrawState.stopRequested) {
+    return true;
+  }
+
+  if (!isSentInvitationListEmpty()) {
+    return false;
+  }
+
+  withdrawState.stopRequested = true;
+  try {
+    const response = await safeSendMessage({
+      type: "STOP_AUTOMATION",
+      payload: {
+        automation: "withdraw",
+        reason: "all_invitations_withdrawn",
+      },
+    });
+    if (!response?.success) {
+      throw new Error(
+        response?.error ?? "Could not stop withdrawal automation",
+      );
+    }
+  } catch (error) {
+    withdrawState.stopRequested = false;
+    throw error;
+  }
+
+  console.info("Withdrawal automation stopped: no pending invitations remain");
+  return true;
 }
 
 function isWithdrawLabel(value) {
@@ -254,6 +302,10 @@ async function processWithdrawQueue() {
   try {
     const buttons = findWithdrawButtons();
     if (buttons.length === 0) {
+      if (await stopWhenInvitationsAreExhausted()) {
+        return;
+      }
+
       if (Date.now() - withdrawState.lastNoButtonsLogAt > 15000) {
         console.info(
           "No withdraw buttons detected on the sent invitations page",
@@ -350,6 +402,10 @@ async function processWithdrawQueue() {
         profileUrl: item.profileUrl,
       });
     }
+
+    if (findWithdrawButtons().length === 0) {
+      await stopWhenInvitationsAreExhausted();
+    }
   } finally {
     withdrawState.lock = false;
   }
@@ -369,6 +425,18 @@ const invitationObserver = new MutationObserver(() => {
 
 if (document.body) {
   invitationObserver.observe(document.body, { childList: true, subtree: true });
+}
+
+if (isExtensionValid() && chrome.storage?.onChanged) {
+  chrome.storage.onChanged.addListener((changes, areaName) => {
+    if (
+      areaName === "local" &&
+      changes.settings?.newValue?.withdrawEnabled &&
+      !changes.settings.oldValue?.withdrawEnabled
+    ) {
+      withdrawState.stopRequested = false;
+    }
+  });
 }
 
 invitationInterval = window.setInterval(() => {

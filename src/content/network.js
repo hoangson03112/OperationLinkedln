@@ -7,6 +7,8 @@ const connectState = {
   lock: false,
   processed: new Set(),
   lastActionAt: 0,
+  stopRequested: false,
+  lastLimitCheckAt: 0,
 };
 
 function randomBetween(min, max) {
@@ -33,6 +35,60 @@ function normalizeText(value) {
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .trim();
+}
+
+function hasWeeklyInvitationLimitError() {
+  const text = normalizeText(document.body?.innerText || "");
+  return (
+    /\bweekly.{0,60}(?:invitation|connection request).{0,60}(?:limit|maximum|reached|too many)\b/.test(text) ||
+    /\bweekly.{0,40}(?:limit|maximum).{0,60}(?:invitation|connection request)\b/.test(text) ||
+    /\b(?:invitation|connection request).{0,60}(?:weekly|per week).{0,40}(?:limit|maximum|reached)\b/.test(text) ||
+    /\b(?:you(?:'| a)?ve|you have) reached (?:the )?(?:weekly )?(?:invitation|connection request) limit\b/.test(text) ||
+    /\b(?:reached|hit).{0,30}(?:the )?(?:weekly )?(?:limit|maximum).{0,50}(?:invitation|connection request)\b/.test(text) ||
+    /\btoo many invitations? (?:this week|per week)\b/.test(text) ||
+    /\b(?:invitation|connection request).{0,60}(?:try again )?next week\b/.test(text) ||
+    /\bmaximum number of (?:invitations?|connection requests?).{0,40}(?:this week|weekly|per week)\b/.test(text)
+  );
+}
+
+async function stopForWeeklyInvitationLimit() {
+  if (connectState.stopRequested) {
+    return true;
+  }
+
+  if (
+    !hasWeeklyInvitationLimitError() ||
+    Date.now() - connectState.lastLimitCheckAt < 2000
+  ) {
+    return false;
+  }
+
+  connectState.lastLimitCheckAt = Date.now();
+  connectState.stopRequested = true;
+  try {
+    const { settings } = await safeReadSettings();
+    if (settings.paused || !settings.connectEnabled) {
+      connectState.stopRequested = false;
+      return false;
+    }
+
+    const response = await safeSendMessage({
+      type: 'STOP_AUTOMATION',
+      payload: {
+        automation: 'connect',
+        reason: 'weekly_invitation_limit',
+      },
+    });
+    if (!response?.success) {
+      throw new Error(response?.error ?? 'Could not stop connection automation');
+    }
+
+    console.warn('Connection automation stopped: weekly invitation limit reached');
+    return true;
+  } catch (error) {
+    connectState.stopRequested = false;
+    throw error;
+  }
 }
 
 function isVisible(element) {
@@ -261,6 +317,14 @@ async function processConnectQueue() {
     return;
   }
 
+  if (await stopForWeeklyInvitationLimit()) {
+    return;
+  }
+
+  if (connectState.stopRequested) {
+    return;
+  }
+
   const result = await safeReadSettings();
   const settings = result.settings;
 
@@ -287,6 +351,10 @@ async function processConnectQueue() {
       .slice(0, limit);
 
     for (const item of buttons) {
+      if (await stopForWeeklyInvitationLimit()) {
+        return;
+      }
+
       if (!isExtensionValid()) {
         stopConnectScript();
         return;
@@ -371,6 +439,9 @@ const networkObserver = new MutationObserver(() => {
     stopConnectScript();
     return;
   }
+  void stopForWeeklyInvitationLimit().catch((error) => {
+    console.error('Could not stop connection automation after weekly limit', error);
+  });
   window.setTimeout(() => {
     void processConnectQueue().catch((error) => {
       console.error('Could not process connection requests', error);
@@ -387,5 +458,18 @@ networkInterval = window.setInterval(() => {
     console.error('Could not process connection requests', error);
   });
 }, 7000);
+
+if (isExtensionValid() && chrome.storage?.onChanged) {
+  chrome.storage.onChanged.addListener((changes, areaName) => {
+    if (
+      areaName === 'local' &&
+      changes.settings?.newValue?.connectEnabled &&
+      !changes.settings.oldValue?.connectEnabled
+    ) {
+      connectState.stopRequested = false;
+      connectState.lastLimitCheckAt = 0;
+    }
+  });
+}
 
 console.log('[ConnectionManager:connect] active on', location.pathname);

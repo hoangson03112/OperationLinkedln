@@ -106,6 +106,26 @@ h1 {
   background: #d9971a;
 }
 
+.status-badge[data-state="completed"] {
+  border-color: #b6e4cc;
+  background: #f0fbf5;
+  color: #176b43;
+}
+
+.status-badge[data-state="completed"]::before {
+  background: #19a463;
+}
+
+.status-badge[data-state="error"] {
+  border-color: #f2c5c5;
+  background: #fff3f3;
+  color: #a52c2c;
+}
+
+.status-badge[data-state="error"]::before {
+  background: #d64545;
+}
+
 .status-badge[data-state="loading"]::before {
   background: #0a66c2;
 }
