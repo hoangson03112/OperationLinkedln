@@ -1,28 +1,72 @@
 import {
+  getSettings,
+  getState,
   saveCandidate,
-  saveInvitation
+  saveInvitation,
+  updateSettings,
+  updateState
 } from '../storage/storage';
 
 chrome.runtime.onInstalled.addListener(async () => {
-  await chrome.storage.local.set({
-    settings: {
-      connectEnabled: false,
-      withdrawEnabled: false,
-      maxActionsPerRun: 20
-    },
+  const stored = await chrome.storage.local.get([
+    'settings',
+    'state',
+    'candidates',
+    'invitations',
+    'automationDefaultsVersion'
+  ]);
+  const settings = {
+    ...(await getSettings()),
+    ...(stored.settings ?? {})
+  };
 
-    state: {
+  if (stored.automationDefaultsVersion !== 1) {
+    settings.connectEnabled = false;
+    settings.withdrawEnabled = false;
+  }
+
+  await chrome.storage.local.set({
+    settings,
+    automationDefaultsVersion: 1,
+    state: stored.state ?? {
       connectStatus: 'idle',
       withdrawStatus: 'idle',
       connectCount: 0,
       withdrawCount: 0
     },
-
-    candidates: [],
-
-    invitations: []
+    candidates: stored.candidates ?? [],
+    invitations: stored.invitations ?? []
   });
 });
+
+chrome.runtime.onStartup.addListener(async () => {
+  const settings = await getSettings();
+  await updateSettings({
+    connectEnabled: settings.connectEnabled ?? false,
+    withdrawEnabled: settings.withdrawEnabled ?? false,
+    maxActionsPerRun: Math.min(
+      20,
+      Math.max(1, Number(settings.maxActionsPerRun) || 20)
+    ),
+    paused: settings.paused ?? false
+  });
+});
+
+let countUpdateQueue: Promise<unknown> = Promise.resolve();
+
+function incrementCounter(
+  counter: 'connectCount' | 'withdrawCount'
+): Promise<number> {
+  const update = countUpdateQueue.then(async () => {
+    const state = await getState();
+    const count = Number(state[counter] ?? 0) + 1;
+    await updateState({ [counter]: count });
+    return count;
+  });
+
+  countUpdateQueue = update.catch(() => undefined);
+  return update;
+}
 
 chrome.runtime.onMessage.addListener(
   (message, _sender, sendResponse) => {
@@ -50,20 +94,33 @@ chrome.runtime.onMessage.addListener(
         },
         tabs => {
           const url = tabs[0]?.url ?? '';
+          let pathname = '';
 
-          if (url.includes('/mynetwork')) {
+          try {
+            pathname = new URL(url).pathname;
+          } catch {
             sendResponse({
-              page: 'network'
+              page: 'unknown'
+            });
+            return;
+          }
+
+          if (
+            /^\/mynetwork\/invitation-manager\/sent\/?$/.test(pathname)
+          ) {
+            sendResponse({
+              page: 'withdraw'
             });
 
             return;
           }
 
           if (
-            url.includes('/mynetwork/invitation-manager')
+            /^\/mynetwork(?:\/.*)?$/.test(pathname) &&
+            !pathname.startsWith('/mynetwork/invitation-manager')
           ) {
             sendResponse({
-              page: 'invitations'
+              page: 'connect'
             });
 
             return;
@@ -83,22 +140,44 @@ chrome.runtime.onMessage.addListener(
 chrome.runtime.onMessage.addListener(
   (message, _sender, sendResponse) => {
     if (message.type === 'CONNECTION_DETECTED') {
-      void saveCandidate(message.payload);
+      if (!message.payload?.id) {
+        sendResponse({
+          success: false,
+          error: 'Action id is required'
+        });
+        return true;
+      }
 
-      sendResponse({
-        success: true
-      });
-
+      void saveCandidate(message.payload)
+        .then(() => incrementCounter('connectCount'))
+        .then(count => sendResponse({ success: true, count }))
+        .catch(error =>
+          sendResponse({
+            success: false,
+            error: error instanceof Error ? error.message : String(error)
+          })
+        );
       return true;
     }
 
     if (message.type === 'INVITATION_DETECTED') {
-      void saveInvitation(message.payload);
+      if (!message.payload?.id) {
+        sendResponse({
+          success: false,
+          error: 'Action id is required'
+        });
+        return true;
+      }
 
-      sendResponse({
-        success: true
-      });
-
+      void saveInvitation(message.payload)
+        .then(() => incrementCounter('withdrawCount'))
+        .then(count => sendResponse({ success: true, count }))
+        .catch(error =>
+          sendResponse({
+            success: false,
+            error: error instanceof Error ? error.message : String(error)
+          })
+        );
       return true;
     }
   }

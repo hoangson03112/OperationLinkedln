@@ -19,21 +19,11 @@ function humanDelay(minMs, maxMs) {
   });
 }
 
-function triggerHumanClick(element) {
+function clickElement(element) {
   if (!(element instanceof HTMLElement)) {
     return;
   }
 
-  element.focus?.();
-  const rect = element.getBoundingClientRect();
-  const x = rect.left + rect.width * randomBetween(0.2, 0.8);
-  const y = rect.top + rect.height * randomBetween(0.2, 0.8);
-
-  element.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: x, clientY: y }));
-  element.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, clientX: x, clientY: y }));
-  element.dispatchEvent(new MouseEvent('pointermove', { bubbles: true, clientX: x, clientY: y }));
-  element.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, cancelable: true, clientX: x, clientY: y }));
-  element.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, clientX: x, clientY: y }));
   element.click();
 }
 
@@ -58,19 +48,47 @@ function isNetworkLikePage() {
   return /^\/mynetwork(?:\/.*)?$/.test(location.pathname) && !location.pathname.startsWith('/mynetwork/invitation-manager');
 }
 
+function isExtensionValid() {
+  return typeof chrome !== 'undefined' && Boolean(chrome.runtime?.id);
+}
+
+function safeSendMessage(message) {
+  if (!isExtensionValid()) {
+    return Promise.reject(new Error('Extension context is unavailable'));
+  }
+  return chrome.runtime.sendMessage(message);
+}
+
 function safeReadSettings() {
-  const storage = typeof chrome !== 'undefined' && chrome.storage ? chrome.storage.local : null;
-  if (!storage) {
-    return Promise.resolve({ settings: { connectEnabled: true, withdrawEnabled: true, maxActionsPerRun: 6, paused: false } });
+  const disabledSettings = {
+    connectEnabled: false,
+    withdrawEnabled: false,
+    maxActionsPerRun: 20,
+    paused: false,
+  };
+
+  if (!isExtensionValid() || !chrome.storage?.local) {
+    return Promise.reject(new Error('Extension storage is unavailable'));
   }
 
-  return new Promise((resolve) => {
+  const storage = chrome.storage.local;
+  return new Promise((resolve, reject) => {
     try {
       storage.get(['settings'], (result) => {
-        resolve({ settings: result.settings ?? { connectEnabled: true, withdrawEnabled: true, maxActionsPerRun: 6, paused: false } });
+        if (!isExtensionValid() || chrome.runtime?.lastError) {
+          reject(
+            new Error(
+              chrome.runtime?.lastError?.message ??
+                'Could not read extension settings',
+            ),
+          );
+          return;
+        }
+
+        resolve({ settings: result.settings ?? disabledSettings });
       });
     } catch (error) {
-      resolve({ settings: { connectEnabled: true, withdrawEnabled: true, maxActionsPerRun: 6, paused: false } });
+      reject(error);
     }
   });
 }
@@ -78,18 +96,40 @@ function safeReadSettings() {
 function matchesConnectSignal(value) {
   const normal = normalizeText(value);
   return (
-    normal.includes('connect') ||
-    normal.includes('ket noi') ||
-    normal.includes('invite') ||
-    normal.includes('gui loi moi') ||
-    normal.includes('send invitation') ||
-    normal.includes('gui ngay') ||
-    normal.includes('request connection')
+    /\bconnect\b/.test(normal) ||
+    /\binvite\b/.test(normal) ||
+    /\bsend invitation\b/.test(normal) ||
+    /\brequest connection\b/.test(normal) ||
+    /\bket noi\b/.test(normal) ||
+    /\b(gui loi moi|moi ket noi)\b/.test(normal)
   );
 }
 
+function getConnectionContext(element) {
+  let current = element.parentElement;
+
+  for (let depth = 0; current && depth < 10; depth += 1) {
+    const profileLink = current.querySelector(
+      'a[href*="/in/"], a[href*="/pub/"], a[href*="/company/"]',
+    );
+    if (profileLink) {
+      return { row: current, profileLink };
+    }
+
+    if (current.matches('li, article, [data-view-name], [data-urn]')) {
+      return { row: current, profileLink: null };
+    }
+
+    current = current.parentElement;
+  }
+
+  return { row: element.parentElement, profileLink: null };
+}
+
 function findConnectButtons() {
-  const nodes = Array.from(document.querySelectorAll('button, a[role="button"], [data-control-name]'));
+  const nodes = Array.from(
+    document.querySelectorAll('button, a[role="button"], [role="button"]'),
+  );
   const matches = [];
 
   for (const node of nodes) {
@@ -104,7 +144,12 @@ function findConnectButtons() {
     const signal = [text, label, title, controlName].join(' ');
 
     const isConnectLike = matchesConnectSignal(signal);
-    if (!isConnectLike || node.disabled || node.getAttribute('aria-disabled') === 'true') {
+    if (
+      !isConnectLike ||
+      node.hasAttribute('disabled') ||
+      node.getAttribute('aria-disabled') === 'true' ||
+      node.closest('[role="dialog"], [aria-modal="true"]')
+    ) {
       continue;
     }
 
@@ -117,8 +162,7 @@ function findConnectButtons() {
       continue;
     }
 
-    const row = node.closest('li') ?? node.closest('article') ?? node.closest('[data-view-name]') ?? node.closest('div');
-    const profileLink = row?.querySelector('a[href*="/in/"]') ?? row?.querySelector('a[href*="/pub/"]') ?? row?.querySelector('a[href*="/company/"]');
+    const { row, profileLink } = getConnectionContext(node);
     const href = profileLink?.href || '';
     const profileUrl = href ? new URL(href, window.location.origin).href : '';
 
@@ -126,7 +170,11 @@ function findConnectButtons() {
       continue;
     }
 
-    const dedupeKey = profileUrl || `${signal}-${Math.random().toString(16).slice(2)}`;
+    if (!profileUrl) {
+      continue;
+    }
+
+    const dedupeKey = new URL(profileUrl).pathname.replace(/\/+$/, '');
     if (connectState.processed.has(dedupeKey)) {
       continue;
     }
@@ -142,44 +190,79 @@ function findConnectButtons() {
   return matches;
 }
 
+function findConnectDialog() {
+  return Array.from(
+    document.querySelectorAll('[role="dialog"], [aria-modal="true"]'),
+  ).find(isVisible);
+}
+
 function findConfirmConnectButton() {
-  const candidates = Array.from(document.querySelectorAll('button, a[role="button"], [data-control-name]'))
-    .filter((element) => element instanceof HTMLElement && isVisible(element));
-
-  const filtered = candidates.filter((element) => {
-    if (!(element instanceof HTMLElement)) {
-      return false;
-    }
-
-    const text = normalizeText(element.innerText || element.textContent || '');
-    const label = normalizeText(element.getAttribute('aria-label') || '');
-    const title = normalizeText(element.getAttribute('title') || '');
-    const controlName = normalizeText(element.getAttribute('data-control-name') || '');
-    const signal = [text, label, title, controlName].join(' ');
-
-    return (
-      signal.includes('send now') ||
-      signal.includes('gui ngay') ||
-      signal.includes('send invitation') ||
-      signal.includes('connect') ||
-      signal.includes('ket noi')
-    );
-  });
-
-  if (!filtered.length) {
+  const dialog = findConnectDialog();
+  if (!dialog) {
     return null;
   }
 
-  return filtered[Math.floor(Math.random() * filtered.length)];
+  return Array.from(dialog.querySelectorAll('button, [role="button"]')).find(
+    (element) => {
+      if (
+        !(element instanceof HTMLElement) ||
+        !isVisible(element) ||
+        element.hasAttribute('disabled') ||
+        element.getAttribute('aria-disabled') === 'true'
+      ) {
+        return false;
+      }
+
+      const signal = [
+        element.innerText || element.textContent || '',
+        element.getAttribute('aria-label') || '',
+        element.getAttribute('title') || '',
+      ]
+        .map(normalizeText)
+        .join(' ');
+
+      return /\b(send|send now|send invitation|gui ngay|gui loi moi)\b/.test(signal);
+    },
+  );
+}
+
+function waitFor(check, timeoutMs) {
+  return new Promise((resolve) => {
+    const startedAt = Date.now();
+    const poll = () => {
+      const value = check();
+      if (value || Date.now() - startedAt >= timeoutMs) {
+        resolve(value || null);
+        return;
+      }
+      window.setTimeout(poll, 100);
+    };
+    poll();
+  });
+}
+
+let networkInterval = null;
+
+function stopConnectScript() {
+  networkObserver.disconnect();
+  if (networkInterval) {
+    clearInterval(networkInterval);
+    networkInterval = null;
+  }
 }
 
 async function processConnectQueue() {
+  if (!isExtensionValid()) {
+    stopConnectScript();
+    return;
+  }
+
   if (!isNetworkLikePage()) {
     return;
   }
 
   const result = await safeReadSettings();
-  const settings = result.settings ?? { connectEnabled: true, withdrawEnabled: true, maxActionsPerRun: 6, paused: false };
+  const settings = result.settings;
 
   if (settings.paused || !settings.connectEnabled) {
     return;
@@ -194,8 +277,8 @@ async function processConnectQueue() {
     return;
   }
 
-  const baseLimit = Math.min(5, Math.max(1, Number(settings.maxActionsPerRun) || 3));
-  const limit = Math.max(1, Math.min(baseLimit, 1 + Math.floor(Math.random() * baseLimit)));
+  const baseLimit = Math.min(20, Math.max(1, Number(settings.maxActionsPerRun) || 1));
+  const limit = baseLimit;
   connectState.lock = true;
 
   try {
@@ -204,25 +287,64 @@ async function processConnectQueue() {
       .slice(0, limit);
 
     for (const item of buttons) {
-      await humanDelay(2500, 7000);
-
-      item.element.scrollIntoView({ block: 'center', inline: 'center' });
-      window.scrollBy({ top: randomBetween(-80, 120), left: 0, behavior: 'auto' });
-      triggerHumanClick(item.element);
-
-      await humanDelay(1800, 4200);
-
-      const confirmButton = findConfirmConnectButton();
-      if (confirmButton && !confirmButton.hasAttribute('disabled')) {
-        confirmButton.scrollIntoView({ block: 'center', inline: 'center' });
-        window.scrollBy({ top: randomBetween(-40, 90), left: 0, behavior: 'auto' });
-        triggerHumanClick(confirmButton);
+      if (!isExtensionValid()) {
+        stopConnectScript();
+        return;
       }
 
-      connectState.processed.add(item.key);
-      connectState.lastActionAt = Date.now();
+      if (
+        !item.element.isConnected ||
+        item.element.hasAttribute('disabled') ||
+        item.element.getAttribute('aria-disabled') === 'true'
+      ) {
+        continue;
+      }
 
-      chrome.runtime.sendMessage({
+      if (findConnectDialog()) {
+        console.warn('A dialog is already open; skipping connection request', item.key);
+        continue;
+      }
+
+      await humanDelay(800, 1600);
+
+      item.element.scrollIntoView({ block: 'center', inline: 'center' });
+      clickElement(item.element);
+
+      const dialogOpened = await waitFor(() => findConnectDialog(), 1200);
+      const confirmButton = dialogOpened
+        ? await waitFor(() => findConfirmConnectButton(), 2000)
+        : false;
+      if (dialogOpened && !confirmButton) {
+        console.warn(
+          'Connection confirmation button was not found',
+          item.key,
+        );
+        continue;
+      }
+      if (confirmButton) {
+        clickElement(confirmButton);
+      }
+
+      const completed = await waitFor(
+        () =>
+          !item.element.isConnected ||
+          /pending|requested|sent|withdraw|message/.test(
+            normalizeText(
+              [
+                item.element.innerText,
+                item.element.getAttribute('aria-label'),
+                item.element.getAttribute('title'),
+              ].join(' '),
+            ),
+          ),
+        8000,
+      );
+      if (!completed) {
+        console.warn('Connection request was not confirmed in the list', item.key);
+        continue;
+      }
+
+      const response = await safeSendMessage({
         type: 'CONNECTION_DETECTED',
         payload: {
           id: item.key,
@@ -231,8 +353,13 @@ async function processConnectQueue() {
           detectedAt: Date.now(),
         },
       });
+      if (!response?.success) {
+        throw new Error(response?.error ?? 'Could not update the connection counter');
+      }
 
-      await humanDelay(5000, 12000);
+      connectState.processed.add(item.key);
+      connectState.lastActionAt = Date.now();
+      await humanDelay(1500, 3000);
     }
   } finally {
     connectState.lock = false;
@@ -240,8 +367,14 @@ async function processConnectQueue() {
 }
 
 const networkObserver = new MutationObserver(() => {
+  if (!isExtensionValid()) {
+    stopConnectScript();
+    return;
+  }
   window.setTimeout(() => {
-    void processConnectQueue();
+    void processConnectQueue().catch((error) => {
+      console.error('Could not process connection requests', error);
+    });
   }, 500);
 });
 
@@ -249,8 +382,10 @@ if (document.body) {
   networkObserver.observe(document.body, { childList: true, subtree: true });
 }
 
-window.setInterval(() => {
-  void processConnectQueue();
+networkInterval = window.setInterval(() => {
+  void processConnectQueue().catch((error) => {
+    console.error('Could not process connection requests', error);
+  });
 }, 7000);
 
 console.log('[ConnectionManager:connect] active on', location.pathname);

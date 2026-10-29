@@ -1,166 +1,245 @@
 if (window.__linkedinConnectionManagerInvitationsInitialized) {
-  throw new Error('Invitations content script already initialized');
+  throw new Error("Invitations content script already initialized");
 }
 window.__linkedinConnectionManagerInvitationsInitialized = true;
 
 const withdrawState = {
   lock: false,
   processed: new Set(),
+  retryAfter: new Map(),
+  lastNoButtonsLogAt: 0,
 };
 
-function randomBetween(min, max) {
-  return Math.random() * (max - min) + min;
-}
-
-function humanDelay(minMs, maxMs) {
-  return new Promise((resolve) => {
-    setTimeout(resolve, randomBetween(minMs, maxMs));
-  });
-}
-
-function triggerHumanClick(element) {
-  if (!(element instanceof HTMLElement)) {
-    return;
-  }
-
-  element.focus?.();
-  const rect = element.getBoundingClientRect();
-  const x = rect.left + rect.width * randomBetween(0.2, 0.8);
-  const y = rect.top + rect.height * randomBetween(0.2, 0.8);
-
-  element.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: x, clientY: y }));
-  element.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, clientX: x, clientY: y }));
-  element.dispatchEvent(new MouseEvent('pointermove', { bubbles: true, clientX: x, clientY: y }));
-  element.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, cancelable: true, clientX: x, clientY: y }));
-  element.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, clientX: x, clientY: y }));
-  element.click();
-}
-
 function normalizeText(value) {
-  return (value ?? '')
+  return (value ?? "")
     .toLowerCase()
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
     .trim();
 }
 
-function safeReadSettings() {
-  const storage = typeof chrome !== 'undefined' && chrome.storage ? chrome.storage.local : null;
+function isExtensionValid() {
+  return typeof chrome !== "undefined" && Boolean(chrome.runtime?.id);
+}
 
-  if (!storage) {
-    return Promise.resolve({ settings: { connectEnabled: true, withdrawEnabled: true, maxActionsPerRun: 6, paused: false } });
+function safeSendMessage(message) {
+  if (!isExtensionValid()) {
+    return Promise.reject(new Error("Extension context is unavailable"));
+  }
+  return chrome.runtime.sendMessage(message);
+}
+
+function safeReadSettings() {
+  if (!isExtensionValid() || !chrome.storage?.local) {
+    return Promise.reject(new Error("Extension storage is unavailable"));
   }
 
-  return new Promise((resolve) => {
+  const storage = chrome.storage.local;
+  return new Promise((resolve, reject) => {
     try {
-      storage.get(['settings'], (result) => {
-        if (chrome.runtime?.lastError) {
-          resolve({ settings: { connectEnabled: true, withdrawEnabled: true, maxActionsPerRun: 6, paused: false } });
+      storage.get(["settings"], (result) => {
+        if (!isExtensionValid() || chrome.runtime?.lastError) {
+          reject(
+            new Error(
+              chrome.runtime?.lastError?.message ??
+                "Could not read extension settings",
+            ),
+          );
           return;
         }
 
-        resolve({ settings: result.settings ?? { connectEnabled: true, withdrawEnabled: true, maxActionsPerRun: 6, paused: false } });
+        resolve({
+          settings: result.settings ?? {
+            connectEnabled: false,
+            withdrawEnabled: false,
+            maxActionsPerRun: 20,
+            paused: true,
+          },
+        });
       });
     } catch (error) {
-      resolve({ settings: { connectEnabled: true, withdrawEnabled: true, maxActionsPerRun: 6, paused: false } });
+      reject(error);
     }
   });
 }
 
 function isInvitationPage() {
-  return location.href.includes('/mynetwork/invitation-manager');
+  return location.href.includes("/mynetwork/invitation-manager");
 }
 
 function isSentInvitationPage() {
-  return /^\/mynetwork\/invitation-manager(?:\/.*)?$/.test(location.pathname) && !location.pathname.includes('/received') && !location.pathname.includes('/sent/received');
+  return /^\/mynetwork\/invitation-manager\/sent\/?$/.test(location.pathname);
 }
 
-function matchesWithdrawSignal(value) {
+function isWithdrawLabel(value) {
   const text = normalizeText(value);
   return (
-    text.includes('thu hoi') ||
-    text.includes('withdraw') ||
-    text.includes('cancel invitation') ||
-    text.includes('huy') ||
-    text.includes('remove invitation') ||
-    text.includes('revoke') ||
-    text.includes('cancel')
+    /\bwithdraw\b/.test(text) ||
+    /\bcancel\s+(?:the\s+)?invitation\b/.test(text) ||
+    /\bremove\s+(?:the\s+)?invitation\b/.test(text) ||
+    /\bthu hoi(?: loi moi)?\b/.test(text) ||
+    /\bhuy loi moi\b/.test(text)
   );
 }
 
+function isVisible(element) {
+  const rect = element.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0;
+}
+
+function getButtonLabels(element) {
+  return [
+    element.innerText || element.textContent || "",
+    element.getAttribute("aria-label") || "",
+    element.getAttribute("title") || "",
+    element.getAttribute("data-control-name") || "",
+  ];
+}
+
+function isEnabled(element) {
+  return (
+    !element.hasAttribute("disabled") &&
+    element.getAttribute("aria-disabled") !== "true"
+  );
+}
+
+function getInvitationContext(element) {
+  let current = element.parentElement;
+
+  for (let depth = 0; current && depth < 10; depth += 1) {
+    const profileLink = current.querySelector(
+      'a[href*="/in/"], a[href*="/pub/"], a[href*="/company/"]',
+    );
+    if (profileLink) {
+      return { row: current, profileLink };
+    }
+
+    if (current.matches("li, article, [data-view-name], [data-urn]")) {
+      return { row: current, profileLink: null };
+    }
+
+    current = current.parentElement;
+  }
+
+  return { row: element.parentElement, profileLink: null };
+}
+
 function findWithdrawButtons() {
-  const candidates = Array.from(document.querySelectorAll('button, a[role="button"], [data-control-name]'));
+  const candidates = Array.from(
+    document.querySelectorAll(
+      'button, a, [role="button"], [data-control-name][tabindex]',
+    ),
+  );
 
   return candidates
-    .map((element) => {
+    .map((element, index) => {
       if (!(element instanceof HTMLElement)) {
         return null;
       }
 
-      const text = normalizeText(element.innerText || element.textContent || '');
-      const label = normalizeText(element.getAttribute('aria-label') || '');
-      const value = normalizeText(element.getAttribute('value') || '');
-      const title = normalizeText(element.getAttribute('title') || '');
-      const controlName = normalizeText(element.getAttribute('data-control-name') || '');
-      const signal = [text, label, value, title, controlName].join(' ');
-      const matches = matchesWithdrawSignal(signal);
-
-      if (!matches || element.hasAttribute('disabled') || element.getAttribute('aria-disabled') === 'true') {
+      const isButton =
+        element.tagName === "BUTTON" ||
+        element.getAttribute("role") === "button";
+      const isLink =
+        element instanceof HTMLAnchorElement && element.hasAttribute("href");
+      const isFocusableControl =
+        element.hasAttribute("data-control-name") && element.tabIndex >= 0;
+      if (!isButton && !isLink && !isFocusableControl) {
         return null;
       }
 
-      const rect = element.getBoundingClientRect();
-      const visible = rect.width > 0 || rect.height > 0 || element.offsetParent !== null;
-      if (!visible) {
+      if (element.parentElement?.closest("button, a[href], [role='button']")) {
         return null;
       }
 
-      const row = element.closest('li') ?? element.closest('article') ?? element.closest('[data-view-name]') ?? element.closest('div');
-      const profileLink = row?.querySelector('a[href*="/in/"]') ?? row?.querySelector('a[href*="/pub/"]') ?? row?.querySelector('a[href*="/company/"]');
-      const profileUrl = profileLink?.href || '';
-      const key = profileUrl || `${signal}-${Math.random().toString(16).slice(2)}`;
+      if (
+        !getButtonLabels(element).some(isWithdrawLabel) ||
+        !isEnabled(element)
+      ) {
+        return null;
+      }
+
+      if (!isVisible(element)) {
+        return null;
+      }
+
+      const { row, profileLink } = getInvitationContext(element);
+      const profileUrl = profileLink?.href || "";
+      const key = profileUrl
+        ? new URL(profileUrl).pathname.replace(/\/+$/, "")
+        : `${location.pathname}:${normalizeText(row?.innerText || element.innerText || "")}:${index}`;
 
       return {
         element,
+        row: row ?? element.parentElement,
         key,
         profileUrl,
-        name: profileLink?.innerText?.trim() || label || text || 'profile',
+        name: profileLink?.innerText?.trim() || "profile",
       };
     })
     .filter(Boolean)
-    .filter((item) => !withdrawState.processed.has(item.key));
+    .filter(
+      (item) =>
+        !withdrawState.processed.has(item.key) &&
+        (withdrawState.retryAfter.get(item.key) ?? 0) <= Date.now(),
+    );
 }
 
-function findConfirmWithdrawButtons() {
-  const candidates = Array.from(document.querySelectorAll('button, a, [role="button"]')).filter((element) => {
-    if (!(element instanceof HTMLElement)) {
-      return false;
-    }
+function findWithdrawDialog() {
+  return Array.from(
+    document.querySelectorAll(
+      '[role="dialog"], [role="alertdialog"], [aria-modal="true"], .artdeco-modal, [data-test-modal]',
+    ),
+  ).find(isVisible);
+}
 
-    const text = normalizeText(element.innerText || element.textContent || '');
-    const label = normalizeText(element.getAttribute('aria-label') || '');
-    const title = normalizeText(element.getAttribute('title') || '');
-    const controlName = normalizeText(element.getAttribute('data-control-name') || '');
-    const visible = element.getBoundingClientRect().width > 0 || element.getBoundingClientRect().height > 0;
+function findConfirmWithdrawButton(dialog) {
+  return Array.from(dialog.querySelectorAll('button, [role="button"]')).find(
+    (element) =>
+      element instanceof HTMLElement &&
+      isVisible(element) &&
+      isEnabled(element) &&
+      getButtonLabels(element).some(isWithdrawLabel),
+  );
+}
 
-    const signal = [text, label, title, controlName].join(' ');
-    return visible && matchesWithdrawSignal(signal);
+function waitFor(check, timeoutMs, intervalMs = 100) {
+  return new Promise((resolve) => {
+    const startedAt = Date.now();
+    const poll = () => {
+      const result = check();
+      if (result || Date.now() - startedAt >= timeoutMs) {
+        resolve(result || null);
+        return;
+      }
+      window.setTimeout(poll, intervalMs);
+    };
+    poll();
   });
+}
 
-  if (!candidates.length) {
-    return [];
+let invitationInterval = null;
+
+function stopWithdrawScript() {
+  invitationObserver.disconnect();
+  if (invitationInterval) {
+    clearInterval(invitationInterval);
+    invitationInterval = null;
   }
-
-  return [...candidates].sort(() => Math.random() - 0.5);
 }
 
 async function processWithdrawQueue() {
+  if (!isExtensionValid()) {
+    stopWithdrawScript();
+    return;
+  }
+
   if (!isInvitationPage() || !isSentInvitationPage()) {
     return;
   }
 
   const result = await safeReadSettings();
-  const settings = result.settings ?? { connectEnabled: true, withdrawEnabled: true, maxActionsPerRun: 6, paused: false };
+  const settings = result.settings;
 
   if (settings.paused || !settings.withdrawEnabled) {
     return;
@@ -170,45 +249,106 @@ async function processWithdrawQueue() {
     return;
   }
 
-  const baseLimit = Math.min(5, Math.max(1, Number(settings.maxActionsPerRun) || 3));
-  const limit = Math.max(1, Math.min(baseLimit, 1 + Math.floor(Math.random() * baseLimit)));
   withdrawState.lock = true;
 
   try {
-    const buttons = [...findWithdrawButtons()]
-      .sort(() => Math.random() - 0.5)
-      .slice(0, limit);
+    const buttons = findWithdrawButtons();
+    if (buttons.length === 0) {
+      if (Date.now() - withdrawState.lastNoButtonsLogAt > 15000) {
+        console.info(
+          "No withdraw buttons detected on the sent invitations page",
+          {
+            path: location.pathname,
+            interactiveElements: document.querySelectorAll(
+              'button, a[href], [role="button"]',
+            ).length,
+          },
+        );
+        withdrawState.lastNoButtonsLogAt = Date.now();
+      }
+      return;
+    }
 
     for (const item of buttons) {
-      await humanDelay(2500, 7000);
-
-      item.element.scrollIntoView({ block: 'center', inline: 'center' });
-      window.scrollBy({ top: randomBetween(-100, 150), left: 0, behavior: 'auto' });
-      triggerHumanClick(item.element);
-
-      await humanDelay(1500, 3500);
-
-      const confirmButton = findConfirmWithdrawButtons()[0];
-      if (confirmButton) {
-        confirmButton.scrollIntoView({ block: 'center', inline: 'center' });
-        window.scrollBy({ top: randomBetween(-90, 140), left: 0, behavior: 'auto' });
-        triggerHumanClick(confirmButton);
+      if (!isExtensionValid()) {
+        stopWithdrawScript();
+        return;
       }
 
-      withdrawState.processed.add(item.key);
+      const currentSettings = await safeReadSettings();
+      if (
+        currentSettings.settings.paused ||
+        !currentSettings.settings.withdrawEnabled
+      ) {
+        return;
+      }
 
-      chrome.runtime.sendMessage({
-        type: 'INVITATION_DETECTED',
+      if (
+        !item.element.isConnected ||
+        !isEnabled(item.element) ||
+        !getButtonLabels(item.element).some(isWithdrawLabel)
+      ) {
+        continue;
+      }
+
+      if (findWithdrawDialog()) {
+        withdrawState.retryAfter.set(item.key, Date.now() + 30000);
+        console.warn("A dialog is already open; skipping withdrawal", item.key);
+        continue;
+      }
+
+      item.element.scrollIntoView({ block: "center", inline: "center" });
+      item.element.click();
+
+      const dialog = await waitFor(findWithdrawDialog, 3000, 25);
+      const confirmButton = dialog && findConfirmWithdrawButton(dialog);
+      if (!confirmButton) {
+        withdrawState.retryAfter.set(item.key, Date.now() + 30000);
+        console.warn(
+          "Withdrawal confirmation dialog/button was not found",
+          item.key,
+        );
+        continue;
+      }
+
+      confirmButton.click();
+      const completed = await waitFor(
+        () =>
+          !item.element.isConnected ||
+          !item.row?.isConnected ||
+          !getButtonLabels(item.element).some(isWithdrawLabel),
+        8000,
+      );
+      if (!completed) {
+        withdrawState.retryAfter.set(item.key, Date.now() + 30000);
+        console.warn(
+          "Withdrawal was not confirmed in the invitation list",
+          item.key,
+        );
+        continue;
+      }
+
+      const response = await safeSendMessage({
+        type: "INVITATION_DETECTED",
         payload: {
           id: item.key,
           name: item.name,
           profileUrl: item.profileUrl,
-          sentAt: Date.now(),
-          status: 'sent',
+          withdrawnAt: Date.now(),
+          status: "withdrawn",
         },
       });
+      if (!response?.success) {
+        throw new Error(
+          response?.error ?? "Could not update the withdrawal counter",
+        );
+      }
 
-      await humanDelay(5000, 12000);
+      withdrawState.processed.add(item.key);
+      withdrawState.retryAfter.delete(item.key);
+      console.info("Invitation withdrawal counted", {
+        profileUrl: item.profileUrl,
+      });
     }
   } finally {
     withdrawState.lock = false;
@@ -216,8 +356,14 @@ async function processWithdrawQueue() {
 }
 
 const invitationObserver = new MutationObserver(() => {
+  if (!isExtensionValid()) {
+    stopWithdrawScript();
+    return;
+  }
   window.setTimeout(() => {
-    void processWithdrawQueue();
+    void processWithdrawQueue().catch((error) => {
+      console.error("Could not process invitation withdrawals", error);
+    });
   }, 400);
 });
 
@@ -225,6 +371,8 @@ if (document.body) {
   invitationObserver.observe(document.body, { childList: true, subtree: true });
 }
 
-window.setInterval(() => {
-  void processWithdrawQueue();
+invitationInterval = window.setInterval(() => {
+  void processWithdrawQueue().catch((error) => {
+    console.error("Could not process invitation withdrawals", error);
+  });
 }, 4000);

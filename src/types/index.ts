@@ -23,6 +23,7 @@ export interface AutomationSettings {
   connectEnabled: boolean;
   withdrawEnabled: boolean;
   maxActionsPerRun: number;
+  paused?: boolean;
 }
 
 export interface AutomationState {
